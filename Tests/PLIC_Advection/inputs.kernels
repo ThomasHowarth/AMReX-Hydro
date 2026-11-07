@@ -1,0 +1,2 @@
+# The plane geometry, normals, wall ghost cells and face density.
+test.kind = kernels
