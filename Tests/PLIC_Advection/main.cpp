@@ -665,6 +665,10 @@ void check_momentum (std::string const& advection)
             drivers::AdvanceOwkesDesjardins(Fv, umv, geoms, ratios, dt, reconstruction, fill);
             drivers::MomentumOwkesDesjardins({&aofs}, {&F_old}, {&vel}, umv, facev, geoms, ratios, rho_l, rho_g, dt,
                                              reconstruction);
+        } else if (advection == "weymouth_yue") {
+            drivers::WeymouthYueRecord record;
+            drivers::AdvanceWeymouthYue(Fv, umv, geoms, ratios, dt, 0, reconstruction, fill, &record);
+            drivers::MomentumWeymouthYue({&aofs}, {&F_old}, {&vel}, umv, facev, geoms, ratios, rho_l, rho_g, dt, record);
         }
 
         if (uniform) {
@@ -706,7 +710,7 @@ int main (int argc, char* argv[])
         if (kind == "kernels") {
             check_kernels();
         } else if (kind == "momentum") {
-            for (auto const& name : Vector<std::string>{"owkes_desjardins"}) {
+            for (auto const& name : Vector<std::string>{"owkes_desjardins", "weymouth_yue"}) {
                 check_momentum(name);
             }
         } else if (kind == "advect") {

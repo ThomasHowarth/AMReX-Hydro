@@ -45,3 +45,14 @@ error on uniform grids (single vortex with `amr.fixed_dt = 0.5/n`):
 
 Zalesak's disk is limited to about first order by the unresolved slot corners, as expected for PLIC
 schemes. With the 3 levels of `inputs.2d.vortex` the error is that of the finest level, 1.39e-4.
+
+### weymouth_yue
+
+The liquid volume is conserved to round-off per step and F stays in [0,1]. L1 shape error on uniform
+grids (single vortex with `amr.fixed_dt = 0.5/n`):
+
+| n     | Zalesak  | single vortex |
+|-------|----------|---------------|
+| 64²   | 3.13e-3  | 1.93e-3       |
+| 128²  | 1.06e-3  | 4.87e-4       |
+| 256²  | 4.83e-4  | 1.43e-4       |

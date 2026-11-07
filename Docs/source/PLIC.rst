@@ -121,6 +121,15 @@ Advection schemes
    number below 1. ``ComputeMomentumFluxes`` gives the mass and momentum fluxes of the same cuts, for a
    consistent momentum advection (Rudman, 1998).
 
+``PLIC::WeymouthYue``
+   The operators of the directionally split Eulerian-implicit scheme of Weymouth & Yue (JCP 229,
+   2010): the fluxes and update of one sweep. The solver sequences the sweeps of a step, cycling their
+   order, with ``c = H(F - 1/2)`` frozen at the start of the step, and fills the ghost cells and
+   synchronizes the levels between sweeps. The step is conservative for a discretely divergence-free
+   ``umac``, and keeps :math:`F` in :math:`[0,1]` for a per-sweep Courant number of at most
+   ``max_courant`` (1/2), above which the step is divided into sub-steps. The momentum advection
+   replays the sweeps (Arrufat et al., JCP 2021).
+
 Adding a scheme
 ---------------
 

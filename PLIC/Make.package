@@ -7,3 +7,7 @@ CEXE_sources += hydro_plic_reconstruction.cpp
 CEXE_headers += hydro_plic_owkes_desjardins.H
 CEXE_headers += hydro_plic_owkes_desjardins_K.H
 CEXE_sources += hydro_plic_owkes_desjardins.cpp
+
+CEXE_headers += hydro_plic_weymouth_yue.H
+CEXE_headers += hydro_plic_weymouth_yue_K.H
+CEXE_sources += hydro_plic_weymouth_yue.cpp

@@ -15,4 +15,7 @@ target_sources(
    hydro_plic_owkes_desjardins.H
    hydro_plic_owkes_desjardins.cpp
    hydro_plic_owkes_desjardins_K.H
+   hydro_plic_weymouth_yue.H
+   hydro_plic_weymouth_yue.cpp
+   hydro_plic_weymouth_yue_K.H
    )

@@ -7,9 +7,11 @@
 
 #include <hydro_plic.H>
 #include <hydro_plic_owkes_desjardins.H>
+#include <hydro_plic_weymouth_yue.H>
 
 #include <AMReX_MultiFabUtil.H>
 
+#include <cmath>
 #include <functional>
 #include <string>
 
@@ -169,6 +171,231 @@ MomentumOwkesDesjardins (amrex::Vector<amrex::MultiFab*> const& aofs,
     amrex::Gpu::streamSynchronize();
 }
 
+// ----------------------------------------------------------------------------------- weymouth_yue
+
+//! What the momentum advection replays of a step
+struct WeymouthYueRecord
+{
+    amrex::Real dt_sub = 0.0;
+    amrex::Vector<int> sweep_dir;
+    amrex::Vector<amrex::Vector<amrex::MultiFab>> sweep_flux; //!< for each sweep and level
+    amrex::Vector<amrex::Vector<amrex::MultiFab>> cmask;      //!< for each sub-step and level
+};
+
+// Clipping only compensates round-off when the sweeps are bounded (per-sweep Courant number of at most
+// max_courant, divergence-free umac): report anything larger than this
+#ifdef AMREX_USE_FLOAT
+inline constexpr amrex::Real clip_report_tol = amrex::Real(1.0e-4);
+#else
+inline constexpr amrex::Real clip_report_tol = amrex::Real(1.0e-12);
+#endif
+
+//! One sweep in direction dir on all levels
+inline void
+SweepWeymouthYue (amrex::Vector<amrex::MultiFab*> const& F,
+                  amrex::Vector<PLIC::FaceConstPtrs> const& umac,
+                  amrex::Vector<amrex::Geometry> const& geom,
+                  amrex::Vector<amrex::IntVect> const& ref_ratio,
+                  std::string const& reconstruction, FillGhostCells const& fill_ghosts,
+                  int dir, amrex::Real dt,
+                  amrex::Vector<amrex::MultiFab> const& cmask,
+                  amrex::Vector<amrex::MultiFab>& flux)
+{
+    const int nlevs = static_cast<int>(F.size());
+    for (int lev = 0; lev < nlevs; ++lev) {
+        flux[lev].define(amrex::convert(F[lev]->boxArray(), amrex::IntVect::TheDimensionVector(dir)),
+                         F[lev]->DistributionMap(), 1, 0);
+        PLIC::WeymouthYue::ComputeSweepFluxes(flux[lev], *F[lev], *umac[lev][dir], geom[lev], dir, dt, reconstruction);
+    }
+    // Coarse faces under fine faces take the fine-face average
+    for (int lev = nlevs - 1; lev > 0; --lev) {
+        amrex::average_down_faces(flux[lev], flux[lev - 1], ref_ratio[lev - 1], geom[lev - 1]);
+    }
+    for (int lev = 0; lev < nlevs; ++lev) {
+        amrex::MultiFab clipped(F[lev]->boxArray(), F[lev]->DistributionMap(), 1, 0);
+        PLIC::WeymouthYue::SweepUpdate(*F[lev], flux[lev], *umac[lev][dir], cmask[lev], geom[lev], dir, dt, &clipped);
+        // Covered cells are overwritten by the average down
+        if (lev < nlevs - 1) {
+            const amrex::iMultiFab mask = amrex::makeFineMask(*F[lev], F[lev + 1]->boxArray(), ref_ratio[lev], 1, 0);
+            auto const& clip_ma = clipped.arrays();
+            auto const& mask_ma = mask.const_arrays();
+            amrex::ParallelFor(clipped, [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept
+            {
+                clip_ma[box_no](i, j, k) *= static_cast<amrex::Real>(mask_ma[box_no](i, j, k));
+            });
+            amrex::Gpu::streamSynchronize();
+        }
+        const amrex::Real clip_max = clipped.norm0();
+        if (clip_max > clip_report_tol) {
+            const amrex::Real cellvol = AMREX_D_TERM(geom[lev].CellSize(0), *geom[lev].CellSize(1), *geom[lev].CellSize(2));
+            amrex::Print() << "   PLIC: WARNING sweep " << dir << " level " << lev
+                           << " clipped volume " << clipped.sum() * cellvol
+                           << " (max cell " << clip_max << ")\n";
+        }
+    }
+    for (int lev = nlevs - 1; lev > 0; --lev) {
+        amrex::average_down(*F[lev], *F[lev - 1], 0, 1, ref_ratio[lev - 1]);
+    }
+    // The next sweep fits the planes again, with these ghost cells
+    for (int lev = 0; lev < nlevs; ++lev) {
+        fill_ghosts(lev, *F[lev]);
+    }
+}
+
+inline void
+AdvanceWeymouthYue (amrex::Vector<amrex::MultiFab*> const& F,
+                    amrex::Vector<PLIC::FaceConstPtrs> const& umac,
+                    amrex::Vector<amrex::Geometry> const& geom,
+                    amrex::Vector<amrex::IntVect> const& ref_ratio,
+                    amrex::Real dt, int step, std::string const& reconstruction,
+                    FillGhostCells const& fill_ghosts,
+                    WeymouthYueRecord* record = nullptr)
+{
+    const int nlevs = static_cast<int>(F.size());
+
+    // Largest face velocity / dx. The step is usually estimated from the cell-centered velocity at
+    // t^n, while the sweeps use the face velocity at t^{n+1/2}, which can be larger
+    amrex::Real umac_rate = 0.0;
+    for (int lev = 0; lev < nlevs; ++lev) {
+        for (int dir = 0; dir < AMREX_SPACEDIM; ++dir) {
+            umac_rate = amrex::max(umac_rate, umac[lev][dir]->norm0(0, 0, true) * geom[lev].InvCellSize(dir));
+        }
+    }
+    amrex::ParallelDescriptor::ReduceRealMax(umac_rate);
+    const amrex::Real courant_max = umac_rate * dt;
+    const int nsub = amrex::max(1, static_cast<int>(std::ceil(courant_max / PLIC::WeymouthYue::max_courant)));
+    if (nsub > 1) {
+        amrex::Print() << "   PLIC: face Courant number " << courant_max
+                       << " exceeds " << PLIC::WeymouthYue::max_courant << ", advecting in " << nsub << " sub-steps\n";
+    }
+    const amrex::Real dt_sub = dt / static_cast<amrex::Real>(nsub);
+    if (record != nullptr) {
+        record->dt_sub = dt_sub;
+    }
+
+    for (int isub = 0; isub < nsub; ++isub) {
+        // c = H(F - 1/2) frozen over the (sub-)step
+        amrex::Vector<amrex::MultiFab> cmask(nlevs);
+        for (int lev = 0; lev < nlevs; ++lev) {
+            cmask[lev].define(F[lev]->boxArray(), F[lev]->DistributionMap(), 1, 0);
+            auto const& c_ma = cmask[lev].arrays();
+            auto const& F_ma = F[lev]->const_arrays();
+            amrex::ParallelFor(cmask[lev], [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept
+            {
+                c_ma[box_no](i, j, k) = (F_ma[box_no](i, j, k) > amrex::Real(0.5)) ? amrex::Real(1.0) : amrex::Real(0.0);
+            });
+        }
+        amrex::Gpu::streamSynchronize();
+
+        // Cycle the order of the sweeps with the step number, so that restarts reproduce it
+        const int cycle = step + isub;
+        for (int s = 0; s < AMREX_SPACEDIM; ++s) {
+            const int dir = (cycle + s) % AMREX_SPACEDIM;
+            amrex::Vector<amrex::MultiFab> flux(nlevs);
+            SweepWeymouthYue(F, umac, geom, ref_ratio, reconstruction, fill_ghosts, dir, dt_sub, cmask, flux);
+            if (record != nullptr) {
+                record->sweep_dir.push_back(dir);
+                record->sweep_flux.push_back(std::move(flux));
+            }
+        }
+        if (record != nullptr) {
+            record->cmask.push_back(std::move(cmask));
+        }
+    }
+}
+
+//! The velocity advection term (u^{**} - u^n) / dt consistent with AdvanceWeymouthYue from F_old
+inline void
+MomentumWeymouthYue (amrex::Vector<amrex::MultiFab*> const& aofs,
+                     amrex::Vector<amrex::MultiFab const*> const& F_old,
+                     amrex::Vector<amrex::MultiFab const*> const& vel_old,
+                     amrex::Vector<PLIC::FaceConstPtrs> const& umac,
+                     amrex::Vector<PLIC::FaceConstPtrs> const& face_state,
+                     amrex::Vector<amrex::Geometry> const& geom,
+                     amrex::Vector<amrex::IntVect> const& ref_ratio,
+                     amrex::Real rho_l, amrex::Real rho_g, amrex::Real dt,
+                     WeymouthYueRecord const& record)
+{
+    const int nlevs = static_cast<int>(aofs.size());
+    const int nsweep = static_cast<int>(record.sweep_dir.size());
+    AMREX_ALWAYS_ASSERT(nsweep > 0 && nsweep == static_cast<int>(record.cmask.size()) * AMREX_SPACEDIM);
+
+    // Mixture density, momentum and the velocity with a ghost layer for the upwinding; u_c is the
+    // velocity at the start of each (sub-)step
+    amrex::Vector<amrex::MultiFab> rho(nlevs);
+    amrex::Vector<amrex::MultiFab> mom(nlevs);
+    amrex::Vector<amrex::MultiFab> vel(nlevs);
+    amrex::Vector<amrex::MultiFab> velc(nlevs);
+    for (int lev = 0; lev < nlevs; ++lev) {
+        amrex::BoxArray const& grids = F_old[lev]->boxArray();
+        amrex::DistributionMapping const& dmap = F_old[lev]->DistributionMap();
+        rho[lev].define(grids, dmap, 1, 0);
+        mom[lev].define(grids, dmap, AMREX_SPACEDIM, 0);
+        vel[lev].define(grids, dmap, AMREX_SPACEDIM, 1);
+        velc[lev].define(grids, dmap, AMREX_SPACEDIM, 0);
+        amrex::MultiFab::Copy(vel[lev], *vel_old[lev], 0, 0, AMREX_SPACEDIM, 1);
+        auto const& F_ma = F_old[lev]->const_arrays();
+        auto const& rho_ma = rho[lev].arrays();
+        auto const& mom_ma = mom[lev].arrays();
+        auto const& vel_ma = vel[lev].const_arrays();
+        amrex::ParallelFor(rho[lev], [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k) noexcept
+        {
+            const amrex::Real r = PLIC::mixture(F_ma[box_no](i, j, k), rho_l, rho_g);
+            rho_ma[box_no](i, j, k) = r;
+            for (int n = 0; n < AMREX_SPACEDIM; ++n) {
+                mom_ma[box_no](i, j, k, n) = r * vel_ma[box_no](i, j, k, n);
+            }
+        });
+    }
+    amrex::Gpu::streamSynchronize();
+
+    for (int isweep = 0; isweep < nsweep; ++isweep) {
+        const int dir = record.sweep_dir[isweep];
+        const int isub = isweep / AMREX_SPACEDIM;
+        if (isweep % AMREX_SPACEDIM == 0) {
+            for (int lev = 0; lev < nlevs; ++lev) {
+                amrex::MultiFab::Copy(velc[lev], vel[lev], 0, 0, AMREX_SPACEDIM, 0);
+            }
+        }
+        amrex::Vector<amrex::MultiFab> mflux(nlevs);
+        amrex::Vector<amrex::MultiFab> pflux(nlevs);
+        for (int lev = 0; lev < nlevs; ++lev) {
+            auto const& lflux = record.sweep_flux[isweep][lev];
+            mflux[lev].define(lflux.boxArray(), lflux.DistributionMap(), 1, 0);
+            pflux[lev].define(lflux.boxArray(), lflux.DistributionMap(), AMREX_SPACEDIM, 0);
+            PLIC::WeymouthYue::ComputeSweepMomentumFluxes(mflux[lev], pflux[lev], lflux, *F_old[lev], vel[lev],
+                                                          *umac[lev][dir], *face_state[lev][dir], dir,
+                                                          record.dt_sub, rho_l, rho_g);
+        }
+        for (int lev = nlevs - 1; lev > 0; --lev) {
+            amrex::average_down_faces(pflux[lev], pflux[lev - 1], ref_ratio[lev - 1], geom[lev - 1]);
+        }
+        for (int lev = 0; lev < nlevs; ++lev) {
+            PLIC::WeymouthYue::SweepMomentumUpdate(rho[lev], mom[lev], vel[lev], mflux[lev], pflux[lev],
+                                                   *umac[lev][dir], record.cmask[isub][lev], velc[lev], geom[lev],
+                                                   dir, record.dt_sub, rho_l, rho_g);
+        }
+        // The intermediate velocities of neighbouring boxes; coarse/fine and physical ghost cells keep
+        // t^n (the interface band is refined away from coarse/fine boundaries, and the wall mass fluxes
+        // vanish)
+        for (int lev = 0; lev < nlevs; ++lev) {
+            vel[lev].FillBoundary(0, AMREX_SPACEDIM, amrex::IntVect(1), geom[lev].periodicity());
+        }
+    }
+
+    for (int lev = 0; lev < nlevs; ++lev) {
+        auto const& aofs_ma = aofs[lev]->arrays();
+        auto const& vel_ma = vel[lev].const_arrays();
+        auto const& velo_ma = vel_old[lev]->const_arrays();
+        amrex::ParallelFor(vel[lev], amrex::IntVect(0), AMREX_SPACEDIM,
+        [=] AMREX_GPU_DEVICE (int box_no, int i, int j, int k, int n) noexcept
+        {
+            aofs_ma[box_no](i, j, k, n) = (vel_ma[box_no](i, j, k, n) - velo_ma[box_no](i, j, k, n)) / dt;
+        });
+    }
+    amrex::Gpu::streamSynchronize();
+}
+
 // -------------------------------------------------------------------------------------- selection
 
 //! Advance F on all levels by one step with the scheme named by plic.advection
@@ -181,11 +408,12 @@ Advance (std::string const& advection_type,
          amrex::Real dt, int step, std::string const& reconstruction,
          FillGhostCells const& fill_ghosts)
 {
-    amrex::ignore_unused(step);
     if (advection_type == "owkes_desjardins") {
         AdvanceOwkesDesjardins(F, umac, geom, ref_ratio, dt, reconstruction, fill_ghosts);
+    } else if (advection_type == "weymouth_yue") {
+        AdvanceWeymouthYue(F, umac, geom, ref_ratio, dt, step, reconstruction, fill_ghosts);
     } else {
-        amrex::Abort("Unknown plic.advection: " + advection_type + " (expected owkes_desjardins)");
+        amrex::Abort("Unknown plic.advection: " + advection_type + " (expected owkes_desjardins or weymouth_yue)");
     }
 }
 
