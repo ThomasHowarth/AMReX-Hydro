@@ -1,0 +1,2 @@
+# The momentum advection of the advection schemes.
+test.kind = momentum

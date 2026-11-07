@@ -2,6 +2,7 @@
 //
 //   test.kind = kernels   the plane geometry, normals, wall ghost cells and face density
 //   test.kind = advect    a prescribed velocity on an AMR hierarchy (see inputs.*)
+//   test.kind = momentum  the momentum advection of the advection schemes
 //
 // The run fails (non-zero exit) when a check does not hold. PLICDrivers.H shows how a solver puts
 // the operators of the library together.
@@ -594,6 +595,105 @@ void check_kernels ()
     }
 }
 
+// A droplet in a uniform and in a non-uniform flow, one step at a time on one periodic level
+void check_momentum (std::string const& advection)
+{
+    Print() << "momentum: " << advection << "\n";
+    const int n = 64;
+    Box domain(IntVect(0), IntVect(n - 1));
+    RealBox rb({AMREX_D_DECL(0.0_rt, 0.0_rt, 0.0_rt)}, {AMREX_D_DECL(1.0_rt, 1.0_rt, 1.0_rt)});
+    Geometry geom(domain, rb, 0, {AMREX_D_DECL(1, 1, 1)});
+    Vector<Geometry> geoms{geom};
+    Vector<IntVect> ratios{IntVect(2)};
+    BoxArray ba(domain);
+    ba.maxSize(32);
+    DistributionMapping dm(ba);
+    const std::string reconstruction = "myc_height";
+    const Real rho_l = 1000.0_rt;
+    const Real rho_g = 1.0_rt;
+    const Real dt = 0.25_rt / static_cast<Real>(n);
+
+    for (const bool uniform : {true, false}) {
+        ProbParm prob;
+        prob.type = uniform ? Prob::Translate : Prob::Vortex;
+        prob.center = {AMREX_D_DECL(0.5_rt, 0.5_rt, 0.5_rt)};
+        Potential pot{prob};
+
+        MultiFab F(ba, dm, 1, PLIC::nGrowF(reconstruction));
+        const auto geomdata = geom.data();
+        auto const& fm = F.arrays();
+        ParallelFor(F, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k) noexcept {
+            fm[b](i, j, k) = initial_fraction(i, j, k, geomdata, prob);
+        });
+        Gpu::streamSynchronize();
+        F.FillBoundary(geom.periodicity());
+
+        Array<MultiFab, AMREX_SPACEDIM> um;
+        Array<MultiFab, AMREX_SPACEDIM> face;
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            um[d].define(convert(ba, IntVect::TheDimensionVector(d)), dm, 1, 1);
+            face[d].define(um[d].boxArray(), dm, AMREX_SPACEDIM, 0);
+        }
+        PLIC::FaceVelocityFromPotential(GetArrOfPtrs(um), geom, 0.0_rt, pot);
+
+        MultiFab vel(ba, dm, AMREX_SPACEDIM, 1);
+        average_face_to_cellcenter(vel, 0, GetArrOfConstPtrs(um));
+        vel.FillBoundary(geom.periodicity());
+        // The upwind state for the faces away from the interface
+        for (int d = 0; d < AMREX_SPACEDIM; ++d) {
+            auto const& fc = face[d].arrays();
+            auto const& v = vel.const_arrays();
+            auto const& u = um[d].const_arrays();
+            const IntVect e = IntVect::TheDimensionVector(d);
+            ParallelFor(face[d], IntVect(0), AMREX_SPACEDIM, [=] AMREX_GPU_DEVICE (int b, int i, int j, int k, int c) noexcept {
+                amrex::ignore_unused(k);
+                const IntVect iv(AMREX_D_DECL(i, j, k));
+                fc[b](iv, c) = (u[b](iv) >= 0.0_rt) ? v[b](iv - e, c) : v[b](iv, c);
+            });
+        }
+        Gpu::streamSynchronize();
+
+        MultiFab F_old(ba, dm, 1, F.nGrow());
+        MultiFab::Copy(F_old, F, 0, 0, 1, F.nGrow());
+        MultiFab aofs(ba, dm, AMREX_SPACEDIM, 0);
+
+        Vector<MultiFab*> Fv{&F};
+        Vector<PLIC::FaceConstPtrs> umv{GetArrOfConstPtrs(um)};
+        Vector<PLIC::FaceConstPtrs> facev{GetArrOfConstPtrs(face)};
+        auto fill = [&geom] (int /*lev*/, MultiFab& a) { a.FillBoundary(geom.periodicity()); };
+        if (advection == "owkes_desjardins") {
+            drivers::AdvanceOwkesDesjardins(Fv, umv, geoms, ratios, dt, reconstruction, fill);
+            drivers::MomentumOwkesDesjardins({&aofs}, {&F_old}, {&vel}, umv, facev, geoms, ratios, rho_l, rho_g, dt,
+                                             reconstruction);
+        }
+
+        if (uniform) {
+            const Real amax = aofs.norm0(0, 0, false) + aofs.norm0(1, 0, false);
+            Print() << "  uniform flow, density ratio 1000: |du/dt| " << amax << "\n";
+            check(amax < 1.0e3_rt * roundoff_tol, "a uniform velocity stays uniform across the interface");
+        } else {
+            // The momentum of the new mixture density and velocity is that of the old ones
+            Real worst = 0.0_rt;
+            for (int c = 0; c < AMREX_SPACEDIM; ++c) {
+                auto const& F0 = F_old.const_arrays();
+                auto const& F1 = F.const_arrays();
+                auto const& v = vel.const_arrays();
+                auto const& a = aofs.const_arrays();
+                Real change = ParReduce(TypeList<ReduceOpSum>{}, TypeList<Real>{}, F, IntVect(0),
+                    [=] AMREX_GPU_DEVICE (int b, int i, int j, int k) -> GpuTuple<Real> {
+                        const Real r0 = PLIC::mixture(F0[b](i, j, k), rho_l, rho_g);
+                        const Real r1 = PLIC::mixture(F1[b](i, j, k), rho_l, rho_g);
+                        return {r1 * (v[b](i, j, k, c) + dt * a[b](i, j, k, c)) - r0 * v[b](i, j, k, c)};
+                    });
+                ParallelDescriptor::ReduceRealSum(change);
+                worst = max(worst, std::abs(change) / static_cast<Real>(ba.numPts()));
+            }
+            Print() << "  vortex flow, density ratio 1000: momentum change per cell " << worst << "\n";
+            check(worst < 1.0e3_rt * roundoff_tol, "the momentum is conserved");
+        }
+    }
+}
+
 } // namespace
 
 int main (int argc, char* argv[])
@@ -605,11 +705,15 @@ int main (int argc, char* argv[])
         pp.query("kind", kind);
         if (kind == "kernels") {
             check_kernels();
+        } else if (kind == "momentum") {
+            for (auto const& name : Vector<std::string>{"owkes_desjardins"}) {
+                check_momentum(name);
+            }
         } else if (kind == "advect") {
             AdvectTest test;
             test.Run();
         } else {
-            Abort("test.kind must be kernels or advect");
+            Abort("test.kind must be kernels, advect or momentum");
         }
         Print() << ((n_failures == 0) ? "PASSED" : "FAILED") << "\n";
     }

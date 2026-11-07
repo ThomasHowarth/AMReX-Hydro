@@ -12,4 +12,7 @@ target_sources(
    hydro_plic_K.H
    hydro_plic_normals_K.H
    hydro_plic_reconstruction.cpp
+   hydro_plic_owkes_desjardins.H
+   hydro_plic_owkes_desjardins.cpp
+   hydro_plic_owkes_desjardins_K.H
    )

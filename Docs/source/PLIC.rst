@@ -16,7 +16,22 @@ coordinates and does not support embedded boundaries. Like the rest of AMReX-Hyd
 operators on one level, and leaves the time integration to the solver: the update of :math:`F`, its
 ghost cells, the synchronization of the levels and any subcycling. The reconstruction is selected by
 name, as ``advection_type`` is in ``HydroUtils::ComputeFluxesOnBoxFromState``, and each advection
-scheme has its own namespace.
+scheme has its own namespace. For example, one step of the unsplit scheme on one level:
+
+.. code-block:: cpp
+
+   #include <hydro_plic_owkes_desjardins.H>
+
+   // F at t^n with PLIC::nGrowF(reconstruction) filled ghost cells, umac at t^{n+1/2}
+   std::string reconstruction = "myc_height";
+   amrex::Array<amrex::MultiFab, AMREX_SPACEDIM> liquid;   // on the faces of the grids of F
+   PLIC::OwkesDesjardins::ComputeFluxes(liquid, F, umac, geom, dt, reconstruction);
+
+   // The solver then updates F += sum_dir (liquid_lo - liquid_hi) / dx, averaging the fine fluxes
+   // down onto the coarse faces with one time step on all levels, or refluxing with subcycling
+
+``Tests/PLIC_Advection/PLICDrivers.H`` is a complete driver for both schemes, with all levels at the
+same time step, including the momentum advection.
 
 Fluxes
 ------
@@ -99,7 +114,12 @@ Reconstructions
 Advection schemes
 -----------------
 
-Each scheme is added in its own change.
+``PLIC::OwkesDesjardins``
+   The unsplit geometric fluxes of Owkes & Desjardins (JCP 270, 2014). Each face carries the liquid
+   inside its flux volume, built from the mesh nodes traced back along the flow. With one update per
+   step it conserves the liquid volume to round-off without clipping, and it needs a face Courant
+   number below 1. ``ComputeMomentumFluxes`` gives the mass and momentum fluxes of the same cuts, for a
+   consistent momentum advection (Rudman, 1998).
 
 Adding a scheme
 ---------------
